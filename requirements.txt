@@ -89,6 +89,7 @@ frozenlist @ file:///croot/frozenlist_1698702560391/work
 fsspec @ file:///croot/fsspec_1701286474621/work
 future @ file:///croot/future_1677599870788/work
 gensim @ file:///croot/gensim_1674852436045/work
+geoopt==0.5.0
 gmpy2 @ file:///tmp/build/80754af9/gmpy2_1645455532332/work
 greenlet @ file:///croot/greenlet_1702059959679/work
 h5py==2.10.0
@@ -281,7 +282,8 @@ safetensors @ file:///croot/safetensors_1692949033383/work
 scikit-image @ file:///croot/scikit-image_1669241743693/work
 scikit-learn @ file:///croot/scikit-learn_1680198742267/work
 scikit-learn-intelex==2021.20220215.212714
-scipy @ file:///tmp/build/80754af9/scipy_1641555001653/work
+# geoopt 0.5.0 requires SciPy's pre-1.12 line-search API.
+scipy>=1.10.1,<1.12
 Scrapy @ file:///croot/scrapy_1677738182270/work
 seaborn @ file:///croot/seaborn_1673479180098/work
 SecretStorage @ file:///croot/secretstorage_1678709481048/work
