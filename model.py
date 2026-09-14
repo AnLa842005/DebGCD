@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from hyptorch.nn import HypLinear, ToPoincare
 from torch import _weight_norm
 
 
@@ -89,6 +90,90 @@ class DebGCDHead(nn.Module):
         logits_gcd = self.last_layer(x)
         logits_deb = self.last_layer_deb(x)
         return x_proj, logits_gcd, logits_ood, logits_deb
+
+
+class HypDebGCDHead(nn.Module):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        ood_dim,
+        use_bn=False,
+        norm_last_layer=True,
+        noodlayers=3,
+        hidden_dim=2048,
+        bottleneck_dim=256,
+        c=0.05,
+        clip_r=None,
+        riemannian=False,
+    ):
+        super().__init__()
+
+        self.hyperbolic_projector = ToPoincare(
+            c=c,
+            ball_dim=in_dim,
+            riemannian=riemannian,
+            clip_r=clip_r,
+        )
+        self.last_layer = HypLinear(
+            in_features=in_dim,
+            out_features=out_dim,
+            c=c,
+        )
+
+        # -------------------- debiased classifier --------------------
+        self.last_layer_deb = HypLinear(
+            in_features=in_dim,
+            out_features=out_dim,
+            c=c,
+        )
+
+        # -------------------- semantic distribution learning --------------------
+        if noodlayers:
+            noodlayers = max(noodlayers, 1)
+            if noodlayers == 1:
+                self.mlp_ood = nn.Linear(in_dim, bottleneck_dim)
+            elif noodlayers != 0:
+                layers_ood = [nn.Linear(in_dim, hidden_dim)]
+                if use_bn:
+                    layers_ood.append(nn.BatchNorm1d(hidden_dim))
+                layers_ood.append(nn.GELU())
+                for _ in range(noodlayers - 2):
+                    layers_ood.append(nn.Linear(hidden_dim, hidden_dim))
+                    if use_bn:
+                        layers_ood.append(nn.BatchNorm1d(hidden_dim))
+                    layers_ood.append(nn.GELU())
+                layers_ood.append(nn.Linear(hidden_dim, bottleneck_dim))
+                self.mlp_ood = nn.Sequential(*layers_ood)
+        else:
+            self.mlp_ood = nn.Identity()
+
+        if noodlayers:
+            if noodlayers > 1:
+                for m in self.mlp_ood:
+                    if isinstance(m, nn.Linear):
+                        torch.nn.init.trunc_normal_(m.weight, std=.02)
+                        if isinstance(m, nn.Linear) and m.bias is not None:
+                            nn.init.constant_(m.bias, 0)
+            else:
+                torch.nn.init.trunc_normal_(self.mlp_ood.weight, std=.02)
+                if self.mlp_ood.bias is not None:
+                    nn.init.constant_(self.mlp_ood.bias, 0)
+        if noodlayers:
+            self.last_layer_ood = nn.utils.weight_norm(nn.Linear(bottleneck_dim, 2*ood_dim, bias=False))
+        else:
+            self.last_layer_ood = nn.utils.weight_norm(nn.Linear(in_dim, 2*ood_dim, bias=False))
+        self.last_layer_ood.weight_g.data.fill_(1)
+
+        if norm_last_layer:
+            self.last_layer_ood.weight_g.requires_grad = False
+
+    def forward(self, x):
+        logits_ood = self.last_layer_ood(nn.functional.normalize(self.mlp_ood(x), dim=-1, p=2))
+        hyp_x = self.hyperbolic_projector(x)
+        logits_gcd = self.last_layer(hyp_x)
+        logits_deb = self.last_layer_deb(hyp_x)
+        return hyp_x, logits_gcd, logits_ood, logits_deb
 
 
 class ContrastiveLearningViewGenerator(object):
