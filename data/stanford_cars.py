@@ -109,12 +109,12 @@ def get_train_val_indices(train_dataset, val_split=0.2):
 
 
 def get_scars_datasets(train_transform, test_transform, train_classes=range(160), prop_train_labels=0.8,
-                    split_train_val=False, seed=0):
+                    split_train_val=False, seed=0, data_dir=car_root):
 
     np.random.seed(seed)
 
     # Init entire training set
-    whole_training_set = CarsDataset(data_dir=car_root, transform=train_transform, train=True)
+    whole_training_set = CarsDataset(data_dir=data_dir, transform=train_transform, train=True)
 
     # Get labelled training set which has subsampled classes, then subsample some indices from that
     train_dataset_labelled = subsample_classes(deepcopy(whole_training_set), include_classes=train_classes)
@@ -132,7 +132,7 @@ def get_scars_datasets(train_transform, test_transform, train_classes=range(160)
     train_dataset_unlabelled = subsample_dataset(deepcopy(whole_training_set), np.array(list(unlabelled_indices)))
 
     # Get test set for all classes
-    test_dataset = CarsDataset(data_dir=car_root, transform=test_transform, train=False)
+    test_dataset = CarsDataset(data_dir=data_dir, transform=test_transform, train=False)
 
     # Either split train into train and val or use test set as val
     train_dataset_labelled = train_dataset_labelled_split if split_train_val else train_dataset_labelled

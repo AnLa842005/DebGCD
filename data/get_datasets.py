@@ -43,10 +43,13 @@ def get_datasets(dataset_name, train_transform, test_transform, args):
 
     # Get datasets
     get_dataset_f = get_dataset_funcs[dataset_name]
+    dataset_kwargs = {}
+    if dataset_name == 'scars' and getattr(args, 'cars_root', None) is not None:
+        dataset_kwargs['data_dir'] = args.cars_root
     datasets = get_dataset_f(train_transform=train_transform, test_transform=test_transform,
                             train_classes=args.train_classes,
                             prop_train_labels=args.prop_train_labels,
-                            split_train_val=False)
+                            split_train_val=False, **dataset_kwargs)
     # Set target transforms:
     target_transform_dict = {}
     for i, cls in enumerate(list(args.train_classes) + list(args.unlabeled_classes)):
