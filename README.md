@@ -17,6 +17,15 @@
   <img src="assets/method.png" alt="teaser" width="80%" />
 </p>
 
+## Opt-in HypCD geometry in the DebGCD pipeline
+
+Use `train_DebGCD.py` without `--use_hyperbolic` for the original DebGCD
+baseline, or add `--use_hyperbolic` for the minimal Hyp-DebGCD comparison.
+Both modes keep the same DebGCD SGD optimizer and SDL/ADL losses. The opt-in
+mode uses hyperbolic and angle representation losses with the HypCD schedule.
+The standalone `train_HypDebGCD.py` and its scripts below are an earlier,
+separate experiment with a different optimizer setup.
+
 ## Hyp-DebGCD Stanford Cars proof of concept
 
 This fork adds `train_HypDebGCD.py` and a hyperbolic head. The original

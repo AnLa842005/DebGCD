@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from hyptorch.nn import HypLinear, ToPoincare
+from hyptorch.pmath import dist_matrix
 from torch import _weight_norm
 
 
@@ -283,6 +284,75 @@ class SupConLoss(torch.nn.Module):
 
 
 
+class HypSupConLoss(torch.nn.Module):
+    """HypCD supervised contrastive loss for distance and angle similarities."""
+
+    def __init__(self, temperature=0.07, contrast_mode='all', hyp_c=0):
+        super().__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.hyp_c = hyp_c
+
+    def forward(self, features, labels=None, mask=None):
+        device = features.device
+        if len(features.shape) < 3:
+            raise ValueError('`features` needs to be [bsz, n_views, ...]')
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both `labels` and `mask`')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32, device=device)
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]
+            anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+
+        if self.hyp_c == 0:
+            similarity = torch.matmul(
+                F.normalize(anchor_feature, dim=-1, p=2),
+                F.normalize(contrast_feature, dim=-1, p=2).T,
+            )
+        else:
+            similarity = -dist_matrix(anchor_feature, contrast_feature, c=self.hyp_c)
+        anchor_dot_contrast = similarity / self.temperature
+
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+        mask = mask.repeat(anchor_count, contrast_count)
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count, device=device).view(-1, 1),
+            0,
+        )
+        mask = mask * logits_mask
+
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+
+        # HypCD uses no temperature/base-temperature multiplier here.
+        loss = -mean_log_prob_pos
+        return loss.view(anchor_count, batch_size).mean()
+
+
 def info_nce_logits(features, n_views=2, temperature=1.0, device='cuda'):
 
     b_ = 0.5 * int(features.size(0))
@@ -311,6 +381,35 @@ def info_nce_logits(features, n_views=2, temperature=1.0, device='cuda'):
 
     logits = logits / temperature
     return logits, labels
+
+
+def hyp_info_nce_logits(features, n_views=2, temperature=1.0, hyp_c=0, normalize=True):
+    """HypCD InfoNCE logits using Poincare distance or normalized angles."""
+    batch_size = features.size(0) // n_views
+    labels = torch.arange(batch_size, device=features.device).repeat(n_views)
+    labels = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
+
+    if normalize:
+        features = F.normalize(features, dim=1)
+
+    if hyp_c == 0:
+        similarity_matrix = torch.matmul(
+            F.normalize(features, dim=-1, p=2),
+            F.normalize(features, dim=-1, p=2).T,
+        )
+    else:
+        similarity_matrix = -dist_matrix(features, features, c=hyp_c)
+
+    mask = torch.eye(labels.shape[0], dtype=torch.bool, device=features.device)
+    labels = labels[~mask].view(labels.shape[0], -1)
+    similarity_matrix = similarity_matrix[~mask].view(similarity_matrix.shape[0], -1)
+
+    positives = similarity_matrix[labels.bool()].view(labels.shape[0], -1)
+    negatives = similarity_matrix[~labels.bool()].view(similarity_matrix.shape[0], -1)
+
+    logits = torch.cat([positives, negatives], dim=1)
+    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=features.device)
+    return logits / temperature, labels
 
 
 def get_params_groups(model):

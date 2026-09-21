@@ -19,9 +19,8 @@ from data.get_datasets import get_datasets, get_class_splits
 from util.general_utils import AverageMeter, init_experiment
 from util.cluster_and_log_utils import log_accs_from_preds
 from config import exp_root
-from model import info_nce_logits, SupConLoss, DistillLoss, ContrastiveLearningViewGenerator, get_params_groups
+from model import info_nce_logits, SupConLoss, hyp_info_nce_logits, HypSupConLoss, DistillLoss, ContrastiveLearningViewGenerator, get_params_groups
 from models import vision_transformer as vits
-from models import vision_transformer2 as vits2
 
 
 def set_random_seed(seed: int) -> None:
@@ -56,6 +55,8 @@ def ova_ent(logits_open):
 
 def train(student, train_loader, test_loader, unlabelled_train_loader, args):
     params_groups = get_params_groups(student)
+    # TODO: Evaluate a dedicated Riemannian optimizer as a later ablation.
+    # The initial POC intentionally keeps DebGCD's optimizer unchanged.
     optimizer = SGD(params_groups, lr=args.lr * (args.batch_size/128), momentum=args.momentum, weight_decay=args.weight_decay)
     fp16_scaler = None
     if args.fp16:
@@ -114,19 +115,61 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
                 loss += (1 - args.sup_weight) * cluster_loss
                 pstr += f'cluster_loss: {cluster_loss.item():.4f} '
 
-                # represent learning, unsup
-                contrastive_logits, contrastive_labels = info_nce_logits(features=student_proj)
-                contrastive_loss = torch.nn.CrossEntropyLoss()(contrastive_logits, contrastive_labels)
+                if args.use_hyperbolic:
+                    contrastive_logits_distance, contrastive_labels_distance = hyp_info_nce_logits(
+                        student_proj, hyp_c=args.c, normalize=False,
+                    )
+                    contrastive_loss_distance = torch.nn.CrossEntropyLoss()(
+                        contrastive_logits_distance, contrastive_labels_distance,
+                    )
+                    contrastive_logits_angle, contrastive_labels_angle = hyp_info_nce_logits(
+                        student_proj, hyp_c=0, normalize=False,
+                        temperature=args.hyper_temp_scale * 1.0,
+                    )
+                    contrastive_loss_angle = torch.nn.CrossEntropyLoss()(
+                        contrastive_logits_angle, contrastive_labels_angle,
+                    )
 
-                # representation learning, sup
-                student_proj = torch.cat([f[mask_lab].unsqueeze(1) for f in student_proj.chunk(2)], dim=1)
-                student_proj = torch.nn.functional.normalize(student_proj, dim=-1)
-                sup_con_labels = class_labels[mask_lab]
-                sup_con_loss = SupConLoss()(student_proj, labels=sup_con_labels)
+                    labelled_proj = torch.cat(
+                        [f[mask_lab].unsqueeze(1) for f in student_proj.chunk(2)], dim=1,
+                    )
+                    sup_con_labels = class_labels[mask_lab]
+                    sup_con_loss_distance = HypSupConLoss(hyp_c=args.c)(
+                        labelled_proj, labels=sup_con_labels,
+                    )
+                    sup_con_loss_angle = HypSupConLoss(
+                        hyp_c=0, temperature=0.07 * args.hyper_temp_scale,
+                    )(labelled_proj, labels=sup_con_labels)
 
-                loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss
-                pstr += f'sup_con_loss: {sup_con_loss.item():.4f} '
-                pstr += f'contrastive_loss: {contrastive_loss.item():.4f} '
+                    loss_distance = ((1 - args.sup_weight) * contrastive_loss_distance
+                                     + args.sup_weight * sup_con_loss_distance)
+                    loss_angle = ((1 - args.sup_weight) * contrastive_loss_angle
+                                  + args.sup_weight * sup_con_loss_angle)
+                    lambda_distance = (epoch - (args.hyper_start_epoch - 1)) / (
+                        args.hyper_end_epoch - args.hyper_start_epoch
+                    )
+                    lambda_distance = max(0.0, min(1.0, lambda_distance)) * args.hyper_max_weight
+                    loss_rep = (1 - lambda_distance) * loss_angle + lambda_distance * loss_distance
+                    loss += loss_rep
+
+                    pstr += f'distance_sup_con_loss: {sup_con_loss_distance.item():.4f} '
+                    pstr += f'distance_contrastive_loss: {contrastive_loss_distance.item():.4f} '
+                    pstr += f'angle_sup_con_loss: {sup_con_loss_angle.item():.4f} '
+                    pstr += f'angle_contrastive_loss: {contrastive_loss_angle.item():.4f} '
+                    pstr += f'lambda_distance: {lambda_distance:.4f} '
+                else:
+                    # Keep the original DebGCD representation path unchanged.
+                    contrastive_logits, contrastive_labels = info_nce_logits(features=student_proj)
+                    contrastive_loss = torch.nn.CrossEntropyLoss()(contrastive_logits, contrastive_labels)
+
+                    student_proj = torch.cat([f[mask_lab].unsqueeze(1) for f in student_proj.chunk(2)], dim=1)
+                    student_proj = torch.nn.functional.normalize(student_proj, dim=-1)
+                    sup_con_labels = class_labels[mask_lab]
+                    sup_con_loss = SupConLoss()(student_proj, labels=sup_con_labels)
+
+                    loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss
+                    pstr += f'sup_con_loss: {sup_con_loss.item():.4f} '
+                    pstr += f'contrastive_loss: {contrastive_loss.item():.4f} '
 
                 # ---------------------------------- Semantic Distribution Learning ----------------------------------
                 # reference: https://github.com/VisionLearningGroup/OP_Match
@@ -177,6 +220,8 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
                 unsup_adl_loss = (F.cross_entropy(unsup_logits_pseudo, targets_u, reduction='none') * mask * ood_cer_score).mean()
                 pstr += f'unsup_adl_loss: {unsup_adl_loss.item():.4f} '
                 loss += args.adl_loss_weight * args.pl_loss_weight * unsup_adl_loss
+                if args.use_hyperbolic:
+                    pstr += f'total_loss: {loss.item():.4f} '
 
             # Train acc
             loss_record.update(loss.item(), class_labels.size(0))
@@ -193,6 +238,8 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
             start = time.perf_counter()
             if batch_idx % args.print_freq == 0:
                 args.logger.info('Epoch: [{}][{}/{}]\t time {:.3f} data_time {:.3f} loss {:.3f}\t {}'.format(epoch, batch_idx, len(train_loader), whole_time, data_time, loss.item(), pstr))
+            if args.max_train_batches > 0 and batch_idx + 1 >= args.max_train_batches:
+                break
 
         args.logger.info('Train Epoch: {} Avg Loss: {:.4f} '.format(epoch, loss_record.avg))
 
@@ -258,6 +305,7 @@ if __name__ == "__main__":
     parser.add_argument('--eval_funcs', nargs='+', help='Which eval functions to use', default=['v2', 'v2p'])
 
     parser.add_argument('--warmup_model_dir', type=str, default=None)
+    parser.add_argument('--cars_root', type=str, default=None)
     parser.add_argument('--dataset_name', type=str, default='scars', help='options: cifar10, cifar100, imagenet_100, cub, scars, fgvc_aricraft, herbarium_19')
     parser.add_argument('--prop_train_labels', type=float, default=0.5)
     parser.add_argument('--use_ssb_splits', action='store_true', default=True)
@@ -268,6 +316,8 @@ if __name__ == "__main__":
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--epochs', default=200, type=int)
+    parser.add_argument('--max_train_batches', default=0, type=int,
+                        help='Stop each epoch after this many batches; 0 runs the full epoch.')
     parser.add_argument('--exp_root', type=str, default=exp_root)
     parser.add_argument('--transform', type=str, default='imagenet')
     parser.add_argument('--sup_weight', type=float, default=0.35)
@@ -284,6 +334,16 @@ if __name__ == "__main__":
     parser.add_argument('--class_num', default=0, type=int)
     parser.add_argument('--dino', type=str, default='v1')
     parser.add_argument('--seed', default=0, type=int)
+
+    # HypCD geometry is opt-in; the default remains the original DebGCD path.
+    parser.add_argument('--use_hyperbolic', action='store_true', default=False)
+    parser.add_argument('--c', type=float, default=0.1)
+    parser.add_argument('--cr', type=float, default=0.0, help='Projection clipping radius; 0 disables clipping.')
+    parser.add_argument('--riemannian', action='store_true', default=False)
+    parser.add_argument('--hyper_start_epoch', type=int, default=0)
+    parser.add_argument('--hyper_end_epoch', type=int, default=200)
+    parser.add_argument('--hyper_max_weight', type=float, default=1.0)
+    parser.add_argument('--hyper_temp_scale', type=float, default=1.0)
 
     # auxiliary debiased classifier
     parser.add_argument('--adl_loss_weight', type=float, default=1.0)
@@ -304,6 +364,10 @@ if __name__ == "__main__":
     # INIT
     # ----------------------
     args = parser.parse_args()
+    if args.max_train_batches < 0:
+        parser.error('--max_train_batches must be nonnegative.')
+    if args.use_hyperbolic and args.hyper_end_epoch <= args.hyper_start_epoch:
+        parser.error('--hyper_end_epoch must be greater than --hyper_start_epoch.')
     device = torch.device('cuda:0')
     args = get_class_splits(args)
 
@@ -313,7 +377,8 @@ if __name__ == "__main__":
     else:
         args.num_unlabeled_classes = args.class_num - args.num_labeled_classes
 
-    init_experiment(args, runner_name=[f'DebGCD_{args.dataset_name}'])
+    runner_name = f'HypDebGCD_{args.dataset_name}' if args.use_hyperbolic else f'DebGCD_{args.dataset_name}'
+    init_experiment(args, runner_name=[runner_name])
     args.logger.info(f'Using evaluation function {args.eval_funcs[0]} to print results')
     # Add a handler for stdout and configure it to log to stdout as well
     args.logger.add(sys.stdout)
@@ -333,6 +398,7 @@ if __name__ == "__main__":
     if args.dino == 'v1':
         backbone = vits.__dict__['vit_base']()
     elif args.dino == 'v2':
+        from models import vision_transformer2 as vits2
         backbone = vits2.__dict__['vit_base']()
         args.warmup_model_dir = args.warmup_model_dir.replace('dino_vitb16', 'dinov2_vitb14_reg4')
     else:
@@ -394,8 +460,20 @@ if __name__ == "__main__":
     # ----------------------
     # PROJECTION HEAD
     # ----------------------
-    from model import DebGCDHead
-    projector = DebGCDHead(in_dim=args.feat_dim, out_dim=args.mlp_out_dim , ood_dim=args.num_labeled_classes, nlayers=args.num_mlp_layers , noodlayers=args.num_ood_layers)
+    if args.use_hyperbolic:
+        from model import HypDebGCDHead
+        projector = HypDebGCDHead(
+            in_dim=args.feat_dim,
+            out_dim=args.mlp_out_dim,
+            ood_dim=args.num_labeled_classes,
+            noodlayers=args.num_ood_layers,
+            c=args.c,
+            clip_r=None if args.cr <= 0 else args.cr,
+            riemannian=args.riemannian,
+        )
+    else:
+        from model import DebGCDHead
+        projector = DebGCDHead(in_dim=args.feat_dim, out_dim=args.mlp_out_dim , ood_dim=args.num_labeled_classes, nlayers=args.num_mlp_layers , noodlayers=args.num_ood_layers)
     model = nn.Sequential(backbone, projector).to(device)
 
     # ----------------------
