@@ -53,6 +53,169 @@ def ova_ent(logits_open):
     return Le
 
 
+class PseudoLabelDiagnostics:
+    """Accumulate detached pseudo-label diagnostics for one training epoch."""
+
+    def __init__(self, num_labeled_classes):
+        self.num_labeled_classes = num_labeled_classes
+        self.confidences = []
+        self.total_views = 0
+        self.accepted_views = 0
+        self.predicted_old = 0
+        self.accepted_predicted_old = 0
+        self.correct = 0
+        self.accepted_correct = 0
+        self.gt_old_views = 0
+        self.gt_old_correct = 0
+        self.accepted_gt_old_views = 0
+        self.accepted_gt_old_correct = 0
+        self.gt_new_views = 0
+        self.gt_new_correct = 0
+        self.accepted_gt_new_views = 0
+        self.accepted_gt_new_correct = 0
+        self.ood_certainty_sum = 0.0
+        self.accepted_ood_certainty_sum = 0.0
+        self.unsup_adl_loss_sum = 0.0
+        self.total_batches = 0
+        self.active_batches = 0
+
+    @staticmethod
+    def _ratio(numerator, denominator):
+        return float('nan') if denominator == 0 else numerator / denominator
+
+    @torch.no_grad()
+    def update(
+        self,
+        max_probs,
+        targets_u,
+        accepted_mask,
+        ground_truth,
+        ood_certainty,
+        unsup_adl_loss,
+    ):
+        confidence = max_probs.detach().float().flatten().cpu()
+        predictions = targets_u.detach().long().flatten().cpu()
+        accepted = accepted_mask.detach().bool().flatten().cpu()
+        ground_truth = ground_truth.detach().long().flatten().cpu()
+        ood_certainty = ood_certainty.detach().float().flatten().cpu()
+
+        num_views = confidence.numel()
+        if not all(
+            tensor.numel() == num_views
+            for tensor in (predictions, accepted, ground_truth, ood_certainty)
+        ):
+            raise ValueError('Pseudo-label diagnostic tensors must have matching lengths.')
+
+        predicted_old = predictions < self.num_labeled_classes
+        correct = predictions.eq(ground_truth)
+        gt_old = ground_truth < self.num_labeled_classes
+        gt_new = ~gt_old
+        accepted_gt_old = accepted & gt_old
+        accepted_gt_new = accepted & gt_new
+
+        self.confidences.append(confidence)
+        self.total_views += num_views
+        self.accepted_views += accepted.sum().item()
+        self.predicted_old += predicted_old.sum().item()
+        self.accepted_predicted_old += (accepted & predicted_old).sum().item()
+        self.correct += correct.sum().item()
+        self.accepted_correct += (accepted & correct).sum().item()
+
+        self.gt_old_views += gt_old.sum().item()
+        self.gt_old_correct += (gt_old & correct).sum().item()
+        self.accepted_gt_old_views += accepted_gt_old.sum().item()
+        self.accepted_gt_old_correct += (accepted_gt_old & correct).sum().item()
+
+        self.gt_new_views += gt_new.sum().item()
+        self.gt_new_correct += (gt_new & correct).sum().item()
+        self.accepted_gt_new_views += accepted_gt_new.sum().item()
+        self.accepted_gt_new_correct += (accepted_gt_new & correct).sum().item()
+
+        self.ood_certainty_sum += ood_certainty.sum().item()
+        self.accepted_ood_certainty_sum += ood_certainty[accepted].sum().item()
+        batch_unsup_adl_loss = unsup_adl_loss.detach().float().item()
+        self.unsup_adl_loss_sum += batch_unsup_adl_loss * num_views
+        self.total_batches += 1
+        self.active_batches += int(batch_unsup_adl_loss > 0.0)
+
+    def summary(self):
+        if not self.confidences:
+            raise RuntimeError('No pseudo-label diagnostics were collected.')
+
+        confidence = torch.cat(self.confidences)
+        quantiles = torch.quantile(
+            confidence,
+            torch.tensor([0.1, 0.5, 0.9], dtype=confidence.dtype),
+        )
+        predicted_new = self.total_views - self.predicted_old
+        accepted_predicted_new = self.accepted_views - self.accepted_predicted_old
+
+        return {
+            'total_views': self.total_views,
+            'accepted_views': self.accepted_views,
+            'acceptance_rate': self._ratio(self.accepted_views, self.total_views),
+            'confidence_mean': confidence.mean().item(),
+            'confidence_std': confidence.std(unbiased=False).item(),
+            'confidence_min': confidence.min().item(),
+            'confidence_p10': quantiles[0].item(),
+            'confidence_p50': quantiles[1].item(),
+            'confidence_p90': quantiles[2].item(),
+            'confidence_max': confidence.max().item(),
+            'predicted_old': self.predicted_old,
+            'predicted_new': predicted_new,
+            'predicted_old_rate': self._ratio(self.predicted_old, self.total_views),
+            'accepted_predicted_old': self.accepted_predicted_old,
+            'accepted_predicted_new': accepted_predicted_new,
+            'accepted_predicted_old_rate': self._ratio(
+                self.accepted_predicted_old,
+                self.accepted_views,
+            ),
+            'pseudo_label_accuracy': self._ratio(self.correct, self.total_views),
+            'accepted_pseudo_label_accuracy': self._ratio(
+                self.accepted_correct,
+                self.accepted_views,
+            ),
+            'gt_old_views': self.gt_old_views,
+            'old_pseudo_label_accuracy': self._ratio(
+                self.gt_old_correct,
+                self.gt_old_views,
+            ),
+            'accepted_gt_old_views': self.accepted_gt_old_views,
+            'accepted_old_pseudo_label_accuracy': self._ratio(
+                self.accepted_gt_old_correct,
+                self.accepted_gt_old_views,
+            ),
+            'gt_new_views': self.gt_new_views,
+            'new_pseudo_label_accuracy': self._ratio(
+                self.gt_new_correct,
+                self.gt_new_views,
+            ),
+            'accepted_gt_new_views': self.accepted_gt_new_views,
+            'accepted_new_pseudo_label_accuracy': self._ratio(
+                self.accepted_gt_new_correct,
+                self.accepted_gt_new_views,
+            ),
+            'ood_certainty_mean': self._ratio(
+                self.ood_certainty_sum,
+                self.total_views,
+            ),
+            'accepted_ood_certainty_mean': self._ratio(
+                self.accepted_ood_certainty_sum,
+                self.accepted_views,
+            ),
+            'unsup_adl_loss_mean': self._ratio(
+                self.unsup_adl_loss_sum,
+                self.total_views,
+            ),
+            'active_batch_rate': self._ratio(
+                self.active_batches,
+                self.total_batches,
+            ),
+            'active_batches': self.active_batches,
+            'total_batches': self.total_batches,
+        }
+
+
 def train(student, train_loader, test_loader, unlabelled_train_loader, args):
     params_groups = get_params_groups(student)
     # TODO: Evaluate a dedicated Riemannian optimizer as a later ablation.
@@ -81,6 +244,7 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
 
     for epoch in range(args.epochs):
         loss_record = AverageMeter()
+        pseudo_label_diagnostics = PseudoLabelDiagnostics(args.num_labeled_classes)
 
         student.train()
         start = time.perf_counter()
@@ -220,6 +384,22 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
                 unsup_adl_loss = (F.cross_entropy(unsup_logits_pseudo, targets_u, reduction='none') * mask * ood_cer_score).mean()
                 pstr += f'unsup_adl_loss: {unsup_adl_loss.item():.4f} '
                 loss += args.adl_loss_weight * args.pl_loss_weight * unsup_adl_loss
+
+                # Diagnostics only: hidden labels are detached and never feed back into
+                # pseudo-labels, masks, losses, gradients, or optimizer updates.
+                with torch.no_grad():
+                    unsup_ground_truth = torch.cat(
+                        [class_labels[~mask_lab] for _ in range(2)],
+                        dim=0,
+                    )
+                    pseudo_label_diagnostics.update(
+                        max_probs=max_probs,
+                        targets_u=targets_u,
+                        accepted_mask=mask,
+                        ground_truth=unsup_ground_truth,
+                        ood_certainty=ood_cer_score,
+                        unsup_adl_loss=unsup_adl_loss,
+                    )
                 if args.use_hyperbolic:
                     pstr += f'total_loss: {loss.item():.4f} '
 
@@ -241,6 +421,64 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
             if args.max_train_batches > 0 and batch_idx + 1 >= args.max_train_batches:
                 break
 
+        diagnostics = pseudo_label_diagnostics.summary()
+        args.logger.info(
+            'Pseudo-label Epoch: {} | unlabeled views: {} | accepted: {} ({:.2%}) | '
+            'confidence mean/std: {:.4f}/{:.4f} | min/p10/p50/p90/max: '
+            '{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}'.format(
+                epoch,
+                diagnostics['total_views'],
+                diagnostics['accepted_views'],
+                diagnostics['acceptance_rate'],
+                diagnostics['confidence_mean'],
+                diagnostics['confidence_std'],
+                diagnostics['confidence_min'],
+                diagnostics['confidence_p10'],
+                diagnostics['confidence_p50'],
+                diagnostics['confidence_p90'],
+                diagnostics['confidence_max'],
+            )
+        )
+        args.logger.info(
+            'Pseudo-label Predictions: old {} ({:.2%}) | new {} ({:.2%}) | '
+            'accepted old {} ({:.2%}) | accepted new {} ({:.2%})'.format(
+                diagnostics['predicted_old'],
+                diagnostics['predicted_old_rate'],
+                diagnostics['predicted_new'],
+                1.0 - diagnostics['predicted_old_rate'],
+                diagnostics['accepted_predicted_old'],
+                diagnostics['accepted_predicted_old_rate'],
+                diagnostics['accepted_predicted_new'],
+                1.0 - diagnostics['accepted_predicted_old_rate'],
+            )
+        )
+        args.logger.info(
+            'Pseudo-label Accuracy: all {:.2%} | accepted {:.2%} | '
+            'GT old {:.2%} (views {}) | GT new {:.2%} (views {}) | '
+            'accepted old {:.2%} (views {}) | accepted new {:.2%} (views {})'.format(
+                diagnostics['pseudo_label_accuracy'],
+                diagnostics['accepted_pseudo_label_accuracy'],
+                diagnostics['old_pseudo_label_accuracy'],
+                diagnostics['gt_old_views'],
+                diagnostics['new_pseudo_label_accuracy'],
+                diagnostics['gt_new_views'],
+                diagnostics['accepted_old_pseudo_label_accuracy'],
+                diagnostics['accepted_gt_old_views'],
+                diagnostics['accepted_new_pseudo_label_accuracy'],
+                diagnostics['accepted_gt_new_views'],
+            )
+        )
+        args.logger.info(
+            'Unsupervised ADL Diagnostics: epoch mean {:.6f} | active batches '
+            '{}/{} ({:.2%}) | OOD certainty mean/accepted {:.4f}/{:.4f}'.format(
+                diagnostics['unsup_adl_loss_mean'],
+                diagnostics['active_batches'],
+                diagnostics['total_batches'],
+                diagnostics['active_batch_rate'],
+                diagnostics['ood_certainty_mean'],
+                diagnostics['accepted_ood_certainty_mean'],
+            )
+        )
         args.logger.info('Train Epoch: {} Avg Loss: {:.4f} '.format(epoch, loss_record.avg))
 
         # Step schedule
