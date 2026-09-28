@@ -19,10 +19,12 @@
 
 ## Opt-in HypCD geometry in the DebGCD pipeline
 
-Use `train_DebGCD.py` without `--use_hyperbolic` for the original DebGCD
-baseline, or add `--use_hyperbolic` for the minimal Hyp-DebGCD comparison.
-Both modes keep the same DebGCD SGD optimizer and SDL/ADL losses. The opt-in
-mode uses hyperbolic and angle representation losses with the HypCD schedule.
+Use `train_DebGCD.py` without geometry flags for the original DebGCD baseline.
+Use `--use_hyperbolic_rep` for a Euclidean DebGCD classifier with hyperbolic
+and angle representation losses, or combine `--use_hyperbolic_head` and
+`--use_hyperbolic_rep` for full Hyp-DebGCD. The legacy `--use_hyperbolic` flag
+still enables both options. All modes keep the same DebGCD SGD optimizer and
+SDL/ADL losses.
 The standalone `train_HypDebGCD.py` and its scripts below are an earlier,
 separate experiment with a different optimizer setup.
 

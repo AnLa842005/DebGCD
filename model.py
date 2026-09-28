@@ -177,6 +177,100 @@ class HypDebGCDHead(nn.Module):
         return hyp_x, logits_gcd, logits_ood, logits_deb
 
 
+class EuclideanRepresentationHead(nn.Module):
+    """Original DebGCD MLP used when only the classifier head is hyperbolic."""
+
+    def __init__(self, in_dim, nlayers=3, hidden_dim=2048, bottleneck_dim=256):
+        super().__init__()
+        nlayers = max(nlayers, 1)
+        if nlayers == 1:
+            self.mlp = nn.Linear(in_dim, bottleneck_dim)
+        else:
+            layers = [nn.Linear(in_dim, hidden_dim), nn.GELU()]
+            for _ in range(nlayers - 2):
+                layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.GELU()])
+            layers.append(nn.Linear(hidden_dim, bottleneck_dim))
+            self.mlp = nn.Sequential(*layers)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.trunc_normal_(module.weight, std=.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class DebGCDModel(nn.Sequential):
+    """Compose independent classifier-head and representation-loss geometry."""
+
+    def __init__(
+        self,
+        backbone,
+        in_dim,
+        out_dim,
+        ood_dim,
+        nlayers=3,
+        noodlayers=3,
+        use_hyperbolic_head=False,
+        use_hyperbolic_rep=False,
+        c=0.1,
+        clip_r=1.2,
+        riemannian=False,
+    ):
+        if use_hyperbolic_head:
+            head = HypDebGCDHead(
+                in_dim=in_dim,
+                out_dim=out_dim,
+                ood_dim=ood_dim,
+                noodlayers=noodlayers,
+                c=c,
+                clip_r=clip_r,
+                riemannian=riemannian,
+            )
+        else:
+            head = DebGCDHead(
+                in_dim=in_dim,
+                out_dim=out_dim,
+                ood_dim=ood_dim,
+                nlayers=nlayers,
+                noodlayers=noodlayers,
+            )
+
+        super().__init__(backbone, head)
+        self.use_hyperbolic_head = use_hyperbolic_head
+        self.use_hyperbolic_rep = use_hyperbolic_rep
+
+        if use_hyperbolic_rep and not use_hyperbolic_head:
+            self.representation_projector = ToPoincare(
+                c=c,
+                ball_dim=in_dim,
+                riemannian=riemannian,
+                clip_r=clip_r,
+            )
+        elif use_hyperbolic_head and not use_hyperbolic_rep:
+            self.representation_projector = EuclideanRepresentationHead(
+                in_dim=in_dim,
+                nlayers=nlayers,
+            )
+        else:
+            self.representation_projector = None
+
+    @property
+    def head(self):
+        return self._modules['1']
+
+    def forward(self, x):
+        features = self._modules['0'](x)
+        representation, logits_gcd, logits_ood, logits_deb = self.head(features)
+        if self.representation_projector is not None:
+            representation = self.representation_projector(features)
+        return representation, logits_gcd, logits_ood, logits_deb
+
+
 class ContrastiveLearningViewGenerator(object):
     """Take two random crops of one image as the query and key."""
 
