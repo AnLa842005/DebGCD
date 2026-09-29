@@ -284,6 +284,18 @@ def compute_representation_loss(student_proj, class_labels, mask_lab, epoch, arg
     return loss_rep, log_text
 
 
+def compute_pseudo_labels(student_out, mask_lab, threshold):
+    """Build detached unlabeled pseudo-labels from the main classifier."""
+    unsup_logits = torch.cat(
+        [features[~mask_lab] for features in (student_out / 0.1).chunk(2)],
+        dim=0,
+    )
+    pseudo_label = torch.softmax(unsup_logits.detach(), dim=-1)
+    max_probs, targets_u = torch.max(pseudo_label, dim=-1)
+    mask = max_probs.ge(threshold).float()
+    return max_probs, targets_u, mask
+
+
 def train(student, train_loader, test_loader, unlabelled_train_loader, args):
     params_groups = get_params_groups(student)
     # TODO: Evaluate a dedicated Riemannian optimizer as a later ablation.
@@ -396,12 +408,11 @@ def train(student, train_loader, test_loader, unlabelled_train_loader, args):
                 loss += args.adl_loss_weight * (1 - args.pl_loss_weight) * sup_adl_loss
 
                 unsup_logits_pseudo = torch.cat([f[~mask_lab] for f in (pseudo_out / args.pseudo_temp).chunk(2)], dim=0)
-                # softmax score
-                unsup_logits = torch.cat([f[~mask_lab] for f in (student_out / 0.1).chunk(2)], dim=0)
-                pseudo_label = torch.softmax(unsup_logits.detach(), dim=-1)
-                # logit
-                max_probs, targets_u = torch.max(pseudo_label, dim=-1)
-                mask = max_probs.ge(args.threshold).float()
+                max_probs, targets_u, mask = compute_pseudo_labels(
+                    student_out,
+                    mask_lab,
+                    args.threshold,
+                )
                 # weighting the loss using distribution certainty score
                 unsup_adl_loss = (F.cross_entropy(unsup_logits_pseudo, targets_u, reduction='none') * mask * ood_cer_score).mean()
                 pstr += f'unsup_adl_loss: {unsup_adl_loss.item():.4f} '
@@ -599,6 +610,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_hyperbolic', action='store_true', default=False)
     parser.add_argument('--use_hyperbolic_head', action='store_true', default=False)
     parser.add_argument('--use_hyperbolic_rep', action='store_true', default=False)
+    parser.add_argument('--use_hyperbolic_aux_only', action='store_true', default=False)
     parser.add_argument('--c', type=float, default=0.1)
     parser.add_argument('--cr', type=float, default=1.2, help='Projection clipping radius; 0 disables clipping.')
     parser.add_argument('--riemannian', action='store_true', default=False)
@@ -629,6 +641,13 @@ if __name__ == "__main__":
     if args.use_hyperbolic:
         args.use_hyperbolic_head = True
         args.use_hyperbolic_rep = True
+    if args.use_hyperbolic_aux_only and (
+        args.use_hyperbolic_head or args.use_hyperbolic_rep
+    ):
+        parser.error(
+            '--use_hyperbolic_aux_only cannot be combined with '
+            '--use_hyperbolic_head, --use_hyperbolic_rep, or --use_hyperbolic.'
+        )
     if args.max_train_batches < 0:
         parser.error('--max_train_batches must be nonnegative.')
     if args.use_hyperbolic_rep and args.hyper_end_epoch <= args.hyper_start_epoch:
@@ -642,7 +661,11 @@ if __name__ == "__main__":
     else:
         args.num_unlabeled_classes = args.class_num - args.num_labeled_classes
 
-    hyper_mode = args.use_hyperbolic_head or args.use_hyperbolic_rep
+    hyper_mode = (
+        args.use_hyperbolic_head
+        or args.use_hyperbolic_rep
+        or args.use_hyperbolic_aux_only
+    )
     runner_name = f'HypDebGCD_{args.dataset_name}' if hyper_mode else f'DebGCD_{args.dataset_name}'
     init_experiment(args, runner_name=[runner_name])
     args.logger.info(f'Using evaluation function {args.eval_funcs[0]} to print results')
@@ -735,6 +758,7 @@ if __name__ == "__main__":
         noodlayers=args.num_ood_layers,
         use_hyperbolic_head=args.use_hyperbolic_head,
         use_hyperbolic_rep=args.use_hyperbolic_rep,
+        use_hyperbolic_aux_only=args.use_hyperbolic_aux_only,
         c=args.c,
         clip_r=None if args.cr <= 0 else args.cr,
         riemannian=args.riemannian,

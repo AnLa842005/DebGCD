@@ -9,7 +9,22 @@ from torch import _weight_norm
 
 
 class DebGCDHead(nn.Module):
-    def __init__(self, in_dim, out_dim, ood_dim, use_bn=False, norm_last_layer=True, nlayers=3, noodlayers=3, hidden_dim=2048, bottleneck_dim=256):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        ood_dim,
+        use_bn=False,
+        norm_last_layer=True,
+        nlayers=3,
+        noodlayers=3,
+        hidden_dim=2048,
+        bottleneck_dim=256,
+        use_hyperbolic_aux=False,
+        c=0.1,
+        clip_r=1.2,
+        riemannian=False,
+    ):
         super().__init__()
         nlayers = max(nlayers, 1)
         if nlayers == 1:
@@ -32,6 +47,8 @@ class DebGCDHead(nn.Module):
         self.last_layer.weight_g.data.fill_(1)
 
         # -------------------- debiased classifier --------------------
+        self.use_hyperbolic_aux = use_hyperbolic_aux
+        self.hyperbolic_aux_projector = None
         self.last_layer_deb = nn.utils.weight_norm(nn.Linear(in_dim, out_dim, bias=False))
         self.last_layer_deb.weight_g.data.fill_(1)
 
@@ -77,6 +94,22 @@ class DebGCDHead(nn.Module):
             self.last_layer_deb.weight_g.requires_grad = False
             self.last_layer_ood.weight_g.requires_grad = False
 
+        if use_hyperbolic_aux:
+            # Build all E0 modules first so a fixed seed gives E7 identical main,
+            # representation, and OOD initialization. Only the auxiliary module
+            # is then replaced for the controlled E7 ablation.
+            self.hyperbolic_aux_projector = ToPoincare(
+                c=c,
+                ball_dim=in_dim,
+                riemannian=riemannian,
+                clip_r=clip_r,
+            )
+            self.last_layer_deb = HypLinear(
+                in_features=in_dim,
+                out_features=out_dim,
+                c=c,
+            )
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             torch.nn.init.trunc_normal_(m.weight, std=.02)
@@ -86,10 +119,14 @@ class DebGCDHead(nn.Module):
     def forward(self, x):
         logits_ood = self.last_layer_ood(nn.functional.normalize(self.mlp_ood(x), dim=-1, p=2))
         x_proj = self.mlp(x)
-        x = nn.functional.normalize(x, dim=-1, p=2)
+        normalized_x = nn.functional.normalize(x, dim=-1, p=2)
         # x = x.detach()
-        logits_gcd = self.last_layer(x)
-        logits_deb = self.last_layer_deb(x)
+        logits_gcd = self.last_layer(normalized_x)
+        if self.use_hyperbolic_aux:
+            hyp_x = self.hyperbolic_aux_projector(x)
+            logits_deb = self.last_layer_deb(hyp_x)
+        else:
+            logits_deb = self.last_layer_deb(normalized_x)
         return x_proj, logits_gcd, logits_ood, logits_deb
 
 
@@ -220,7 +257,14 @@ class DebGCDModel(nn.Sequential):
         c=0.1,
         clip_r=1.2,
         riemannian=False,
+        use_hyperbolic_aux_only=False,
     ):
+        if use_hyperbolic_aux_only and (use_hyperbolic_head or use_hyperbolic_rep):
+            raise ValueError(
+                'use_hyperbolic_aux_only cannot be combined with '
+                'use_hyperbolic_head or use_hyperbolic_rep.'
+            )
+
         if use_hyperbolic_head:
             head = HypDebGCDHead(
                 in_dim=in_dim,
@@ -238,11 +282,16 @@ class DebGCDModel(nn.Sequential):
                 ood_dim=ood_dim,
                 nlayers=nlayers,
                 noodlayers=noodlayers,
+                use_hyperbolic_aux=use_hyperbolic_aux_only,
+                c=c,
+                clip_r=clip_r,
+                riemannian=riemannian,
             )
 
         super().__init__(backbone, head)
         self.use_hyperbolic_head = use_hyperbolic_head
         self.use_hyperbolic_rep = use_hyperbolic_rep
+        self.use_hyperbolic_aux_only = use_hyperbolic_aux_only
 
         if use_hyperbolic_rep and not use_hyperbolic_head:
             self.representation_projector = ToPoincare(
