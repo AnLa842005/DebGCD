@@ -611,6 +611,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_hyperbolic_head', action='store_true', default=False)
     parser.add_argument('--use_hyperbolic_rep', action='store_true', default=False)
     parser.add_argument('--use_hyperbolic_aux_only', action='store_true', default=False)
+    parser.add_argument('--use_hyperbolic_main_only', action='store_true', default=False)
     parser.add_argument('--c', type=float, default=0.1)
     parser.add_argument('--cr', type=float, default=1.2, help='Projection clipping radius; 0 disables clipping.')
     parser.add_argument('--riemannian', action='store_true', default=False)
@@ -642,10 +643,19 @@ if __name__ == "__main__":
         args.use_hyperbolic_head = True
         args.use_hyperbolic_rep = True
     if args.use_hyperbolic_aux_only and (
-        args.use_hyperbolic_head or args.use_hyperbolic_rep
+        args.use_hyperbolic_head
+        or args.use_hyperbolic_rep
+        or args.use_hyperbolic_main_only
     ):
         parser.error(
             '--use_hyperbolic_aux_only cannot be combined with '
+            'other hyperbolic flags.'
+        )
+    if args.use_hyperbolic_main_only and (
+        args.use_hyperbolic_head or args.use_hyperbolic_rep
+    ):
+        parser.error(
+            '--use_hyperbolic_main_only cannot be combined with '
             '--use_hyperbolic_head, --use_hyperbolic_rep, or --use_hyperbolic.'
         )
     if args.max_train_batches < 0:
@@ -665,6 +675,7 @@ if __name__ == "__main__":
         args.use_hyperbolic_head
         or args.use_hyperbolic_rep
         or args.use_hyperbolic_aux_only
+        or args.use_hyperbolic_main_only
     )
     runner_name = f'HypDebGCD_{args.dataset_name}' if hyper_mode else f'DebGCD_{args.dataset_name}'
     init_experiment(args, runner_name=[runner_name])
@@ -759,6 +770,7 @@ if __name__ == "__main__":
         use_hyperbolic_head=args.use_hyperbolic_head,
         use_hyperbolic_rep=args.use_hyperbolic_rep,
         use_hyperbolic_aux_only=args.use_hyperbolic_aux_only,
+        use_hyperbolic_main_only=args.use_hyperbolic_main_only,
         c=args.c,
         clip_r=None if args.cr <= 0 else args.cr,
         riemannian=args.riemannian,

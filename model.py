@@ -24,6 +24,7 @@ class DebGCDHead(nn.Module):
         c=0.1,
         clip_r=1.2,
         riemannian=False,
+        use_hyperbolic_main=False,
     ):
         super().__init__()
         nlayers = max(nlayers, 1)
@@ -43,6 +44,8 @@ class DebGCDHead(nn.Module):
             self.mlp = nn.Sequential(*layers)
 
         self.apply(self._init_weights)
+        self.use_hyperbolic_main = use_hyperbolic_main
+        self.hyperbolic_main_projector = None
         self.last_layer = nn.utils.weight_norm(nn.Linear(in_dim, out_dim, bias=False))
         self.last_layer.weight_g.data.fill_(1)
 
@@ -94,6 +97,22 @@ class DebGCDHead(nn.Module):
             self.last_layer_deb.weight_g.requires_grad = False
             self.last_layer_ood.weight_g.requires_grad = False
 
+        if use_hyperbolic_main:
+            # Build all E0 modules first so a fixed seed gives E6 identical aux,
+            # representation, and OOD initialization. Only the main classifier
+            # is then replaced for the controlled E6 ablation.
+            self.hyperbolic_main_projector = ToPoincare(
+                c=c,
+                ball_dim=in_dim,
+                riemannian=riemannian,
+                clip_r=clip_r,
+            )
+            self.last_layer = HypLinear(
+                in_features=in_dim,
+                out_features=out_dim,
+                c=c,
+            )
+
         if use_hyperbolic_aux:
             # Build all E0 modules first so a fixed seed gives E7 identical main,
             # representation, and OOD initialization. Only the auxiliary module
@@ -121,7 +140,11 @@ class DebGCDHead(nn.Module):
         x_proj = self.mlp(x)
         normalized_x = nn.functional.normalize(x, dim=-1, p=2)
         # x = x.detach()
-        logits_gcd = self.last_layer(normalized_x)
+        if self.use_hyperbolic_main:
+            hyp_main_x = self.hyperbolic_main_projector(x)
+            logits_gcd = self.last_layer(hyp_main_x)
+        else:
+            logits_gcd = self.last_layer(normalized_x)
         if self.use_hyperbolic_aux:
             hyp_x = self.hyperbolic_aux_projector(x)
             logits_deb = self.last_layer_deb(hyp_x)
@@ -258,10 +281,22 @@ class DebGCDModel(nn.Sequential):
         clip_r=1.2,
         riemannian=False,
         use_hyperbolic_aux_only=False,
+        use_hyperbolic_main_only=False,
     ):
-        if use_hyperbolic_aux_only and (use_hyperbolic_head or use_hyperbolic_rep):
+        if use_hyperbolic_aux_only and (
+            use_hyperbolic_head
+            or use_hyperbolic_rep
+            or use_hyperbolic_main_only
+        ):
             raise ValueError(
                 'use_hyperbolic_aux_only cannot be combined with '
+                'other hyperbolic modes.'
+            )
+        if use_hyperbolic_main_only and (
+            use_hyperbolic_head or use_hyperbolic_rep
+        ):
+            raise ValueError(
+                'use_hyperbolic_main_only cannot be combined with '
                 'use_hyperbolic_head or use_hyperbolic_rep.'
             )
 
@@ -286,12 +321,14 @@ class DebGCDModel(nn.Sequential):
                 c=c,
                 clip_r=clip_r,
                 riemannian=riemannian,
+                use_hyperbolic_main=use_hyperbolic_main_only,
             )
 
         super().__init__(backbone, head)
         self.use_hyperbolic_head = use_hyperbolic_head
         self.use_hyperbolic_rep = use_hyperbolic_rep
         self.use_hyperbolic_aux_only = use_hyperbolic_aux_only
+        self.use_hyperbolic_main_only = use_hyperbolic_main_only
 
         if use_hyperbolic_rep and not use_hyperbolic_head:
             self.representation_projector = ToPoincare(
